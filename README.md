@@ -1742,3 +1742,93 @@ The slippage check now runs in **both paper and live modes** (previously live on
 [marketService] Network error resolving token for market 0xabc... — skipping trade
 [executor]      Token mapping failed — skipping trade abc-xyz (market=0xabc...)
 ```
+
+---
+
+## Final Hardening
+
+### What Was Fixed
+
+Improved execution accuracy and safety for live market trading.
+
+---
+
+### Key Improvements
+
+| Improvement | Detail |
+|-------------|--------|
+| **Orderbook-based pricing** | Replaced midpoint price with live best bid/ask from `GET /book`. Buy orders use `bestAsk`; sell orders use `bestBid` — the actual prices the bot will trade at |
+| **Dynamic slippage control** | Slippage tolerance adjusts based on market liquidity. Liquid markets (spread ≤ 5%) allow up to 3% slippage; illiquid markets (spread > 5%) tighten to 2% |
+| **Execution confirmation** | After `createAndPostOrder`, the response `success` flag is validated. If the exchange rejects the order, an error is thrown — triggering the retry loop rather than silently succeeding |
+| **Safe exposure updates** | Exposure counters are only incremented after confirmed successful execution. A failed or rejected order never inflates the risk budget |
+
+---
+
+### How Slippage Works
+
+```
+spread = (bestAsk - bestBid) / bestAsk
+
+if spread > 0.05 (illiquid):
+    maxSlippage = LOW_LIQUIDITY_SLIPPAGE = 0.02  (2%)
+else:
+    maxSlippage = DEFAULT_MAX_SLIPPAGE    = 0.03  (3%)
+
+slippage = abs(currentPrice - trade.price) / trade.price
+if slippage > maxSlippage → skip trade
+```
+
+---
+
+### Execution Flow
+
+```
+Trade →
+Decision →
+Risk →
+Balance →
+Market Mapping →
+Orderbook Price →
+Slippage Check (dynamic) →
+Execution Guards (price > 0, quantity > 0) →
+Order Placement →
+Confirmation (response.success) →
+Exposure Update
+```
+
+---
+
+### Example Log Output
+
+**Liquid market — order placed:**
+
+```
+[executor] Orderbook: bestBid=0.61 bestAsk=0.63 spread=3.17%
+           | Slippage: trade.price=0.62 currentPrice=0.63 slippage=1.61% limit=3%
+[executor] Execution attempt 1
+[executor] Placing live order: BUY quantity=158.7302 shares @ $0.62 cost=$100.0000 USDC | tokenId=71321...
+[executor] Order accepted by Polymarket: orderId=0xDe9... txHash=0xabc... trade=abc-xyz
+[executor] Execution success: trade abc-xyz
+```
+
+**Illiquid market — slippage rejected:**
+
+```
+[executor] Orderbook: bestBid=0.55 bestAsk=0.70 spread=21.43%
+           | Slippage: trade.price=0.62 currentPrice=0.70 slippage=12.90% limit=2%
+[executor] Slippage exceeded — skipping trade abc-xyz: 12.90% > 2% (... spread=21.43%)
+```
+
+**Exchange rejection:**
+
+```
+[executor] Execution attempt 1
+[executor] Order not confirmed by Polymarket — trade abc-xyz: insufficient margin
+[executor] Attempt 1/4 failed — retrying in 1000ms
+```
+
+---
+
+### Why It Matters
+
+Using the mid-price for slippage was optimistic — the actual fill price on a limit order is the best ask (buy) or best bid (sell). Wide-spread markets need tighter slippage limits because each side of the book is further from fair value. Confirming `response.success` before updating exposure ensures the risk budget only reflects orders the exchange actually accepted.

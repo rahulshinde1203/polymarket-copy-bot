@@ -32,13 +32,14 @@ export const MIN_REQUIRED_BALANCE = 10;         // Buffer kept in wallet above o
 export const EXECUTION_DEDUP_TTL_S = 3_600;    // Redis TTL for executed order IDs (1 hour)
 
 // ── Slippage protection ───────────────────────────────────────────────────────
-// Decision-time guard (watcher): skip a trade if mid-price has moved more than
-// this fraction from the copied trade's price (0.05 = 5%).
-export const MAX_SLIPPAGE = 0.05;
+// Slippage is computed as abs(orderbook_price - trade.price) / trade.price.
+// In liquid markets (spread ≤ SPREAD_LIQUIDITY_THRESHOLD) the tolerance is
+// DEFAULT_MAX_SLIPPAGE; in illiquid markets it tightens to LOW_LIQUIDITY_SLIPPAGE.
+export const DEFAULT_MAX_SLIPPAGE = 0.03;          // 3% — normal market conditions
+export const LOW_LIQUIDITY_SLIPPAGE = 0.02;        // 2% — wide-spread / illiquid markets
+export const SPREAD_LIQUIDITY_THRESHOLD = 0.05;    // spread > 5% → low-liquidity path
 
 // ── Live execution — Polymarket CLOB ─────────────────────────────────────────
 export const POLYGON_CHAIN_ID = 137;
 // Native USDC on Polygon (6 decimals)
 export const USDC_ADDRESS_POLYGON = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
-// Execution-time guard (executor, live mode only): max price deviation vs mid (%)
-export const MAX_SLIPPAGE_PCT = 1;
