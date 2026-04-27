@@ -3,6 +3,7 @@ import redis from '../infra/cache/redis';
 import { Order } from './orderBuilder';
 import { getWalletBalance } from './balance';
 import { getClobClient } from './polymarketClient';
+import { getMarketToken } from '../services/market.service';
 import { withRetry } from '../utils/helpers';
 import logger from '../config/logger';
 import { env } from '../config/env';
@@ -39,15 +40,15 @@ export async function executeOrder(order: Order): Promise<void> {
 
   const balance = await getWalletBalance(wallet);
   logger.info(
-    `[executor] Wallet balance: $${balance} | Order size: $${order.size}` +
-    ` | Min required: $${order.size + MIN_REQUIRED_BALANCE}`,
+    `[executor] Wallet balance: $${balance} | Order cost: $${order.cost}` +
+    ` | Min required: $${order.cost + MIN_REQUIRED_BALANCE}`,
   );
 
-  if (balance < order.size + MIN_REQUIRED_BALANCE) {
+  if (balance < order.cost + MIN_REQUIRED_BALANCE) {
     logger.warn(
       `[executor] Insufficient balance — skipping trade: ` +
-      `balance=$${balance} < required=$${order.size + MIN_REQUIRED_BALANCE} ` +
-      `(order.size=${order.size} + buffer=${MIN_REQUIRED_BALANCE})`,
+      `balance=$${balance} < required=$${order.cost + MIN_REQUIRED_BALANCE} ` +
+      `(cost=${order.cost} + buffer=${MIN_REQUIRED_BALANCE})`,
     );
     return;
   }
@@ -64,7 +65,8 @@ export async function executeOrder(order: Order): Promise<void> {
 
     try {
       const client = getClobClient();
-      const midpointResp = await client.getMidpoint(order.market);
+      const tokenIdForSlippage = getMarketToken(order.market);
+      const midpointResp = await client.getMidpoint(tokenIdForSlippage);
       const midPrice = parseFloat(midpointResp?.mid ?? '');
 
       if (!isNaN(midPrice) && midPrice > 0) {
@@ -106,9 +108,11 @@ export async function executeOrder(order: Order): Promise<void> {
     logger.info(`[executor] Execution attempt ${attemptCount}`);
 
     if (mode === 'paper') {
+      const tokenId = getMarketToken(order.market);
       logger.info(
-        `[executor] Simulated trade executed: ${order.side.toUpperCase()} ${order.size} units` +
-        ` @ $${order.price} on ${order.market}`,
+        `[executor] Simulated trade executed: ${order.side.toUpperCase()}` +
+        ` quantity=${order.quantity.toFixed(4)} shares @ $${order.price}` +
+        ` cost=$${order.cost.toFixed(4)} USDC | tokenID=${tokenId}`,
       );
       return;
     }
@@ -116,17 +120,19 @@ export async function executeOrder(order: Order): Promise<void> {
     // ── Live: place order via Polymarket CLOB API ────────────────────────────
 
     const client = getClobClient();
+    const tokenId = getMarketToken(order.market);
 
     const userOrder = {
-      tokenID: order.market,
+      tokenID: tokenId,
       price: order.price,
-      size: order.size,
+      size: order.quantity,
       side: order.side === 'buy' ? Side.BUY : Side.SELL,
     };
 
     logger.info(
-      `[executor] Placing live order: ${userOrder.side} ${userOrder.size} units` +
-      ` @ $${userOrder.price} tokenID=${userOrder.tokenID}`,
+      `[executor] Placing live order: ${userOrder.side}` +
+      ` quantity=${order.quantity.toFixed(4)} shares @ $${order.price}` +
+      ` cost=$${order.cost.toFixed(4)} USDC | tokenID=${tokenId}`,
     );
 
     const response = await client.createAndPostOrder(userOrder, undefined, OrderType.GTC);

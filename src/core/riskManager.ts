@@ -21,52 +21,53 @@ async function readExposure(key: string): Promise<number> {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Returns true when the order is within all configured risk limits.
- * Does NOT mutate exposure — call updateExposure() after a successful execution.
+ * Returns true when the order cost is within all configured risk limits.
+ * All limits are denominated in USDC (cost), not shares.
+ * Does NOT mutate exposure — call updateExposure() after successful execution.
  */
-export async function validateTrade(trade: TradeEvent, orderSize: number): Promise<boolean> {
-  if (orderSize > MAX_PER_TRADE) {
+export async function validateTrade(trade: TradeEvent, cost: number): Promise<boolean> {
+  if (cost > MAX_PER_TRADE) {
     logger.debug(
       `[riskManager] Rejected: exceeds per trade limit — ` +
-      `orderSize=${orderSize} > MAX_PER_TRADE=${MAX_PER_TRADE} [id=${trade.id}]`,
+      `cost=$${cost} > MAX_PER_TRADE=$${MAX_PER_TRADE} [id=${trade.id}]`,
     );
     return false;
   }
 
   const totalExposure = await readExposure(TOTAL_EXPOSURE_KEY);
-  if (totalExposure + orderSize > MAX_TOTAL_EXPOSURE) {
+  if (totalExposure + cost > MAX_TOTAL_EXPOSURE) {
     logger.warn(
       `[riskManager] Rejected: exceeds total exposure — ` +
-      `would reach ${totalExposure + orderSize} > MAX_TOTAL_EXPOSURE=${MAX_TOTAL_EXPOSURE} [id=${trade.id}]`,
+      `would reach $${totalExposure + cost} > MAX_TOTAL_EXPOSURE=$${MAX_TOTAL_EXPOSURE} [id=${trade.id}]`,
     );
     return false;
   }
 
   const marketExposure = await readExposure(marketKey(trade.market));
-  if (marketExposure + orderSize > MAX_PER_MARKET) {
+  if (marketExposure + cost > MAX_PER_MARKET) {
     logger.warn(
       `[riskManager] Rejected: exceeds market exposure — ` +
-      `market=${trade.market} would reach ${marketExposure + orderSize}` +
-      ` > MAX_PER_MARKET=${MAX_PER_MARKET} [id=${trade.id}]`,
+      `market=${trade.market} would reach $${marketExposure + cost}` +
+      ` > MAX_PER_MARKET=$${MAX_PER_MARKET} [id=${trade.id}]`,
     );
     return false;
   }
 
   logger.debug(
-    `[riskManager] Accepted: within risk limits — orderSize=${orderSize} [id=${trade.id}]`,
+    `[riskManager] Accepted: within risk limits — cost=$${cost} [id=${trade.id}]`,
   );
   return true;
 }
 
 /**
- * Increments total and per-market exposure counters in Redis after a successful execution.
+ * Increments total and per-market USDC exposure counters after a successful execution.
  * Errors are logged as warnings and do not propagate — the order is already placed.
  */
-export async function updateExposure(orderSize: number, market: string): Promise<void> {
+export async function updateExposure(cost: number, market: string): Promise<void> {
   try {
-    await redis.incrbyfloat(TOTAL_EXPOSURE_KEY, orderSize);
-    await redis.incrbyfloat(marketKey(market), orderSize);
-    logger.debug(`[riskManager] Exposure updated: +${orderSize} on market ${market}`);
+    await redis.incrbyfloat(TOTAL_EXPOSURE_KEY, cost);
+    await redis.incrbyfloat(marketKey(market), cost);
+    logger.debug(`[riskManager] Exposure updated: +$${cost} USDC on market ${market}`);
   } catch (err) {
     logger.warn(
       '[riskManager] Failed to update exposure in Redis',
@@ -75,7 +76,7 @@ export async function updateExposure(orderSize: number, market: string): Promise
   }
 }
 
-/** Returns total exposure snapshot for monitoring or Telegram /stats. */
+/** Returns total USDC exposure snapshot for monitoring or Telegram /stats. */
 export async function getExposureSummary(): Promise<number> {
   return readExposure(TOTAL_EXPOSURE_KEY);
 }

@@ -31,9 +31,14 @@ export const PAPER_SIMULATED_BALANCE = 10_000;  // Simulated wallet balance retu
 export const MIN_REQUIRED_BALANCE = 10;         // Buffer kept in wallet above order.size (live mode)
 export const EXECUTION_DEDUP_TTL_S = 3_600;    // Redis TTL for executed order IDs (1 hour)
 
+// ── Slippage protection ───────────────────────────────────────────────────────
+// Decision-time guard (watcher): skip a trade if mid-price has moved more than
+// this fraction from the copied trade's price (0.05 = 5%).
+export const MAX_SLIPPAGE = 0.05;
+
 // ── Live execution — Polymarket CLOB ─────────────────────────────────────────
 export const POLYGON_CHAIN_ID = 137;
 // Native USDC on Polygon (6 decimals)
 export const USDC_ADDRESS_POLYGON = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
-// Max allowed price deviation between the copied trade price and current mid-price (%)
+// Execution-time guard (executor, live mode only): max price deviation vs mid (%)
 export const MAX_SLIPPAGE_PCT = 1;

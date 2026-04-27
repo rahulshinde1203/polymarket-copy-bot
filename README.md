@@ -1580,3 +1580,72 @@ Real order placement on Polymarket using the official `@polymarket/clob-client` 
 [executor]  Simulated trade executed: BUY 12 units @ $0.62 on 71321...
 [executor]  Execution success: trade abc-xyz
 ```
+
+---
+
+## Fix 6: Trading Accuracy
+
+### What Was Fixed
+
+Corrected order sizing, slippage protection, and market token resolution to prevent incorrect trade execution.
+
+---
+
+### Why It Matters
+
+The previous implementation passed `order.size` (USDC cost) directly as the share quantity to the CLOB API. On Polymarket a price of $0.50 means 1 share costs $0.50 USDC — submitting `size=10` as the quantity when the intent was to spend $10 USDC would attempt to buy 10 shares for $5 each instead of 20 shares for $0.50 each. This fix ensures the bot always places orders for the correct number of shares.
+
+---
+
+### How It Works
+
+**Order sizing (`orderBuilder.ts`):**
+
+```
+cost     = trade.size × (copyPercentage / 100)   [USDC to spend]
+quantity = cost / price                            [shares to buy/sell]
+```
+
+The `Order` type now carries both fields explicitly:
+
+```typescript
+interface Order {
+  cost:     number;   // USDC spend limit (used for risk / balance checks)
+  quantity: number;   // conditional token shares (sent to the CLOB API)
+}
+```
+
+**Risk limits (`riskManager.ts`):** `MAX_PER_TRADE`, `MAX_TOTAL_EXPOSURE`, and `MAX_PER_MARKET` are now validated and tracked against `cost` (USDC), not shares.
+
+**Slippage check (`market.service.ts` → `watcher.service.ts`):** After a trade is accepted by the decision engine but before risk validation, the bot fetches the current mid-price from the CLOB REST API and rejects the trade if the market has moved too far:
+
+```
+abs(mid - trade.price) / trade.price > MAX_SLIPPAGE (5%)  →  skip trade
+```
+
+Fails open (allows trade) on network errors so a temporary CLOB outage does not halt all copying.
+
+**Market token resolution (`market.service.ts`):** `getMarketToken(market)` converts a raw `asset_id` from a trade event to the CLOB `tokenID`. A static `TOKEN_MAP` dictionary allows per-market overrides (e.g. neg-risk markets). Without an override it returns the `asset_id` directly, which is correct for standard markets.
+
+**Executor logging (`executor.ts`):** Every execution path now logs all four key values:
+
+```
+quantity, price, cost, tokenID
+```
+
+---
+
+### Example
+
+Trade detected: BUY 100 USDC of an outcome currently priced at $0.50
+
+```
+cost     = 100 × 1.00  = $100 USDC
+quantity = 100 / 0.50  = 200 shares
+
+[marketService] Slippage check: trade.price=0.50 mid=0.503 slippage=0.60% limit=5%
+[riskManager]   Accepted: within risk limits — cost=$100
+[executor]      Simulated trade executed: BUY quantity=200.0000 shares @ $0.50 cost=$100.0000 USDC | tokenID=71321...
+```
+
+Without this fix the bot would have placed an order to buy **100 shares** (costing $50 instead of $100).

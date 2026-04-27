@@ -5,13 +5,20 @@ export interface Order {
   tradeId: string;
   market: string;
   price: number;
-  size: number;
+  /** USDC to spend: trade.size scaled by copyPercentage */
+  cost: number;
+  /** Conditional-token shares to buy/sell: cost / price */
+  quantity: number;
   side: 'buy' | 'sell';
 }
 
 /**
- * Scales trade.size by copyPercentage and returns a ready-to-execute Order,
- * or null if the resulting order fails any safety check.
+ * Converts a raw TradeEvent into a ready-to-execute Order.
+ *
+ * cost     = trade.size × (copyPercentage / 100)   [USDC]
+ * quantity = cost / price                            [shares]
+ *
+ * Returns null if any safety check fails.
  */
 export function buildOrder(trade: TradeEvent, copyPercentage: number): Order | null {
   if (!trade.market) {
@@ -24,28 +31,37 @@ export function buildOrder(trade: TradeEvent, copyPercentage: number): Order | n
     return null;
   }
 
-  const size = trade.size * (copyPercentage / 100);
+  const cost = trade.size * (copyPercentage / 100);
 
-  if (size <= 0 || !isFinite(size)) {
+  if (cost <= 0 || !isFinite(cost)) {
     logger.warn(
-      `[orderBuilder] Rejected: size=${size} after applying ` +
+      `[orderBuilder] Rejected: cost=${cost} after applying ` +
       `copyPercentage=${copyPercentage}% to trade.size=${trade.size} [id=${trade.id}]`,
     );
     return null;
   }
 
-  const order: Order = {
+  const quantity = cost / trade.price;
+
+  if (quantity <= 0 || !isFinite(quantity)) {
+    logger.warn(
+      `[orderBuilder] Rejected: quantity=${quantity} (cost=${cost} / price=${trade.price}) [id=${trade.id}]`,
+    );
+    return null;
+  }
+
+  logger.info(
+    `[orderBuilder] Order built: ${trade.side.toUpperCase()} ` +
+    `quantity=${quantity.toFixed(4)} shares @ $${trade.price} | cost=$${cost.toFixed(4)} USDC` +
+    ` | market=${trade.market} (copyPct=${copyPercentage}%)`,
+  );
+
+  return {
     tradeId: trade.id,
     market: trade.market,
     price: trade.price,
-    size,
+    cost,
+    quantity,
     side: trade.side,
   };
-
-  logger.info(
-    `[orderBuilder] Order built: ${order.side.toUpperCase()} ${order.size} units` +
-    ` @ $${order.price} on ${order.market} (copyPct=${copyPercentage}%)`,
-  );
-
-  return order;
 }
