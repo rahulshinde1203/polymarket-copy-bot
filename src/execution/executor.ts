@@ -3,11 +3,12 @@ import redis from '../infra/cache/redis';
 import { Order } from './orderBuilder';
 import { getWalletBalance } from './balance';
 import { getClobClient } from './polymarketClient';
-import { getMarketToken } from '../services/market.service';
+import { getTokenId } from '../services/market.service';
+import { getCurrentPrice } from '../services/price.service';
 import { withRetry } from '../utils/helpers';
 import logger from '../config/logger';
 import { env } from '../config/env';
-import { MIN_REQUIRED_BALANCE, EXECUTION_DEDUP_TTL_S } from '../config/constants';
+import { MIN_REQUIRED_BALANCE, EXECUTION_DEDUP_TTL_S, MAX_SLIPPAGE } from '../config/constants';
 
 const EXEC_RETRIES = 3;
 const EXEC_BASE_DELAY_MS = 1_000;
@@ -53,48 +54,51 @@ export async function executeOrder(order: Order): Promise<void> {
     return;
   }
 
-  // ── Slippage check (live mode only) ─────────────────────────────────────────
-  // Compare the copied trade's price against the current CLOB mid-price.
-  // If the market has moved more than MAX_SLIPPAGE_PCT since the trade was
-  // detected, executing at the stale price would cost extra slippage.
+  // ── Token mapping ────────────────────────────────────────────────────────────
+  // Resolve the raw market identifier (asset_id / condition ID) to the CLOB
+  // tokenID.  Returns null only on a genuine network failure — skip the trade.
 
-  if (mode === 'live') {
-    const slippageAllowed = isFinite(env.MAX_SLIPPAGE_PCT) && env.MAX_SLIPPAGE_PCT > 0
-      ? env.MAX_SLIPPAGE_PCT
-      : 1;
+  const tokenId = await getTokenId(order.market);
+  if (!tokenId) {
+    logger.error(
+      `[executor] Token mapping failed — skipping trade ${order.tradeId}` +
+      ` (market=${order.market})`,
+    );
+    return;
+  }
+  logger.info(`[executor] Token resolved: market=${order.market} → tokenId=${tokenId}`);
 
-    try {
-      const client = getClobClient();
-      const tokenIdForSlippage = getMarketToken(order.market);
-      const midpointResp = await client.getMidpoint(tokenIdForSlippage);
-      const midPrice = parseFloat(midpointResp?.mid ?? '');
+  // ── Slippage check ───────────────────────────────────────────────────────────
+  // Fetch the current mid-price and reject if the market has drifted more than
+  // MAX_SLIPPAGE (5%) from the price recorded in the copied trade.
+  // Applies in both paper and live modes — a bad price is a bad price regardless.
+  // On price fetch failure the trade is skipped (fail-safe default).
 
-      if (!isNaN(midPrice) && midPrice > 0) {
-        const deviationPct = Math.abs(order.price - midPrice) / midPrice * 100;
-        logger.info(
-          `[executor] Slippage check: order.price=${order.price} mid=${midPrice} ` +
-          `deviation=${deviationPct.toFixed(3)}% limit=${slippageAllowed}%`,
-        );
+  try {
+    const currentPrice = await getCurrentPrice(tokenId);
+    const slippage = Math.abs(currentPrice - order.price) / order.price;
+    const slippagePct = (slippage * 100).toFixed(2);
 
-        if (deviationPct > slippageAllowed) {
-          logger.warn(
-            `[executor] Slippage exceeded — skipping trade ${order.tradeId}: ` +
-            `deviation=${deviationPct.toFixed(3)}% > limit=${slippageAllowed}%`,
-          );
-          return;
-        }
-      } else {
-        logger.warn(
-          `[executor] Could not fetch mid-price for market ${order.market} — skipping slippage check`,
-        );
-      }
-    } catch (err) {
+    logger.info(
+      `[executor] Slippage check: trade.price=${order.price} currentPrice=${currentPrice}` +
+      ` slippage=${slippagePct}% limit=${(MAX_SLIPPAGE * 100).toFixed(0)}%` +
+      ` tokenId=${tokenId} [trade=${order.tradeId}]`,
+    );
+
+    if (slippage > MAX_SLIPPAGE) {
       logger.warn(
-        `[executor] Slippage check failed for trade ${order.tradeId} — skipping order as precaution`,
-        err instanceof Error ? err : new Error(String(err)),
+        `[executor] Slippage exceeded — skipping trade ${order.tradeId}: ` +
+        `${slippagePct}% > ${(MAX_SLIPPAGE * 100).toFixed(0)}%` +
+        ` (trade.price=${order.price} currentPrice=${currentPrice})`,
       );
       return;
     }
+  } catch (err) {
+    logger.warn(
+      `[executor] Price fetch failed — skipping trade ${order.tradeId} as precaution`,
+      err instanceof Error ? err : new Error(String(err)),
+    );
+    return;
   }
 
   // ── Retry dispatch ───────────────────────────────────────────────────────────
@@ -108,11 +112,10 @@ export async function executeOrder(order: Order): Promise<void> {
     logger.info(`[executor] Execution attempt ${attemptCount}`);
 
     if (mode === 'paper') {
-      const tokenId = getMarketToken(order.market);
       logger.info(
         `[executor] Simulated trade executed: ${order.side.toUpperCase()}` +
         ` quantity=${order.quantity.toFixed(4)} shares @ $${order.price}` +
-        ` cost=$${order.cost.toFixed(4)} USDC | tokenID=${tokenId}`,
+        ` cost=$${order.cost.toFixed(4)} USDC | tokenId=${tokenId}`,
       );
       return;
     }
@@ -120,7 +123,6 @@ export async function executeOrder(order: Order): Promise<void> {
     // ── Live: place order via Polymarket CLOB API ────────────────────────────
 
     const client = getClobClient();
-    const tokenId = getMarketToken(order.market);
 
     const userOrder = {
       tokenID: tokenId,
@@ -132,7 +134,7 @@ export async function executeOrder(order: Order): Promise<void> {
     logger.info(
       `[executor] Placing live order: ${userOrder.side}` +
       ` quantity=${order.quantity.toFixed(4)} shares @ $${order.price}` +
-      ` cost=$${order.cost.toFixed(4)} USDC | tokenID=${tokenId}`,
+      ` cost=$${order.cost.toFixed(4)} USDC | tokenId=${tokenId}`,
     );
 
     const response = await client.createAndPostOrder(userOrder, undefined, OrderType.GTC);

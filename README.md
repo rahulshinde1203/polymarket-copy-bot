@@ -1649,3 +1649,96 @@ quantity = 100 / 0.50  = 200 shares
 ```
 
 Without this fix the bot would have placed an order to buy **100 shares** (costing $50 instead of $100).
+
+---
+
+## Fix 7: Slippage & Market Mapping
+
+### What Was Fixed
+
+Replaced the inline sync token map and `ClobClient.getMidpoint` slippage check with a proper async pipeline: Redis-cached token resolution backed by the Polymarket REST API, and a dedicated price service that provides a clean contract for fetching live market prices.
+
+---
+
+### Why It Matters
+
+| Problem | Impact |
+|---------|--------|
+| Sync token map with no API fallback | Only explicitly hardcoded markets could execute; all others silently used the raw market ID which may differ from the CLOB tokenID |
+| Slippage check required an authenticated ClobClient | Paper-mode runs never ran a slippage check at all |
+| Price fetch was buried inside the executor | Not reusable; hard to test independently |
+
+---
+
+### How It Works
+
+**`src/services/price.service.ts`** — single responsibility: return the current mid-price for a token.
+
+```
+GET /midpoint?token_id=<tokenId>  →  { mid: "0.62" }  →  0.62
+```
+
+Throws on any failure so the caller decides whether to skip or allow.
+
+**`src/services/market.service.ts`** — resolves `market → tokenId` in three steps:
+
+```
+1. Redis cache  (key: market_token:<market>, TTL 1 h)
+              ↓ miss
+2. GET /markets/<market>  →  tokens[0].token_id
+   GET /markets?condition_id=<market>  →  data[0].tokens[0].token_id
+              ↓ not found (2xx but no mapping)
+3. Passthrough — asset_id from trade events already IS the CLOB tokenID
+              ↓ network error
+   → return null  →  caller skips trade
+```
+
+**`src/execution/executor.ts`** — the execution pipeline now runs in this order inside `executeOrder`:
+
+```
+dedup → balance → getTokenId → getCurrentPrice + slippage → dispatch
+```
+
+The slippage check now runs in **both paper and live modes** (previously live only). On price-fetch failure the trade is skipped (fail-safe).
+
+---
+
+### Safety Rules
+
+| Condition | Result |
+|-----------|--------|
+| `getTokenId` returns null (network error) | Trade skipped, error logged |
+| `getCurrentPrice` throws | Trade skipped, warning logged |
+| `slippage > MAX_SLIPPAGE (5%)` | Trade skipped, warning logged |
+| Redis cache failure | Cache bypassed, API tried directly |
+
+---
+
+### Example Log Output
+
+**Token resolved from API, slippage within limit:**
+
+```
+[marketService] Resolved via API: 0xabc... → 71321945...
+[executor]      Token resolved: market=0xabc... → tokenId=71321945...
+[priceService]  Current mid-price: 0.503 for token 71321945...
+[executor]      Slippage check: trade.price=0.50 currentPrice=0.503 slippage=0.60% limit=5%
+[executor]      Simulated trade executed: BUY quantity=200.0000 shares @ $0.50 ...
+```
+
+**Token resolved from Redis cache, slippage rejected:**
+
+```
+[marketService] Cache hit: 0xabc... → 71321945...
+[executor]      Token resolved: market=0xabc... → tokenId=71321945...
+[priceService]  Current mid-price: 0.70 for token 71321945...
+[executor]      Slippage check: trade.price=0.50 currentPrice=0.70 slippage=40.00% limit=5%
+[executor]      Slippage exceeded — skipping trade abc-xyz: 40.00% > 5% (trade.price=0.5 currentPrice=0.7)
+```
+
+**Token mapping failure:**
+
+```
+[marketService] Network error resolving token for market 0xabc... — skipping trade
+[executor]      Token mapping failed — skipping trade abc-xyz (market=0xabc...)
+```

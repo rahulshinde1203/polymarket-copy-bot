@@ -1,89 +1,119 @@
-import { TradeEvent } from '../types/tradeEvent';
+import redis from '../infra/cache/redis';
 import logger from '../config/logger';
-import { POLYMARKET_REST_URL, MAX_SLIPPAGE } from '../config/constants';
+import { POLYMARKET_REST_URL } from '../config/constants';
 
-// ── Market token mapping ──────────────────────────────────────────────────────
-// In Polymarket the asset_id (condition token address) that arrives in trade
-// events IS the CLOB tokenID.  Add entries here only when a market needs an
-// explicit override (e.g. neg-risk markets that use a different token).
+// ── Redis cache ───────────────────────────────────────────────────────────────
 
-const TOKEN_MAP: Record<string, string> = {
-  // '<condition-id>': '<clob-token-id>',
-};
+const CACHE_TTL_S = 3_600; // 1 hour
 
-/**
- * Resolves a raw market ID (asset_id / condition ID from a trade event) to
- * the CLOB tokenID used when building and submitting orders.
- *
- * Falls back to the market value itself when no override is registered —
- * which is correct for the vast majority of Polymarket markets.
- */
-export function getMarketToken(market: string): string {
-  const override = TOKEN_MAP[market];
-  if (override) {
-    logger.debug(`[marketService] Token override: ${market} → ${override}`);
-    return override;
+function cacheKey(market: string): string {
+  return `market_token:${market}`;
+}
+
+// ── Polymarket API types ──────────────────────────────────────────────────────
+
+interface PolyToken {
+  token_id: string;
+  outcome: string;
+  price?: number;
+}
+
+interface MarketPayload {
+  condition_id?: string;
+  tokens?: PolyToken[];
+}
+
+// The /markets endpoint returns either a single object or a paginated wrapper.
+type MarketsApiResponse = MarketPayload | { data?: MarketPayload[] };
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function extractTokenId(body: MarketsApiResponse): string | null {
+  // Single-market response: { tokens: [...] }
+  if ('tokens' in body && Array.isArray(body.tokens)) {
+    return body.tokens[0]?.token_id ?? null;
   }
-  logger.debug(`[marketService] No token override for market ${market} — using asset ID as token ID`);
-  return market;
+  // Paginated response: { data: [{ tokens: [...] }] }
+  if ('data' in body && Array.isArray(body.data)) {
+    return body.data[0]?.tokens?.[0]?.token_id ?? null;
+  }
+  return null;
 }
 
-// ── Slippage check ────────────────────────────────────────────────────────────
-
-interface MidpointResponse {
-  mid?: string;
-}
+// ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Compares the copied trade's price against the current CLOB mid-price.
- * Returns false (skip trade) when slippage exceeds MAX_SLIPPAGE.
- * Fails open (returns true) on any network or parse error so a temporary
- * CLOB outage does not halt all copying.
+ * Resolves a raw market identifier to a Polymarket CLOB token ID.
+ *
+ * Resolution order:
+ *   1. Redis cache  — key: market_token:<market>  TTL: 1 hour
+ *   2. REST API     — GET /markets/<market> then GET /markets?condition_id=<market>
+ *   3. Direct use   — asset_id from trade events already IS the CLOB token ID;
+ *                     used as fallback when neither API variant finds a mapping.
+ *
+ * Returns null only on a genuine network failure, signalling the caller to skip
+ * the trade rather than place it with an unresolved token.
+ *
+ * Logs:
+ *   debug  — cache hit / direct passthrough
+ *   info   — successfully resolved via API
+ *   error  — network failure; trade will be skipped
  */
-export async function checkSlippage(trade: TradeEvent, tokenId: string): Promise<boolean> {
+export async function getTokenId(market: string): Promise<string | null> {
+  // ── 1. Redis cache ──────────────────────────────────────────────────────────
   try {
-    const url = `${POLYMARKET_REST_URL}/midpoint?token_id=${encodeURIComponent(tokenId)}`;
-    const res = await fetch(url);
-
-    if (!res.ok) {
-      logger.warn(
-        `[marketService] Mid-price fetch failed (HTTP ${res.status}) — skipping slippage check [id=${trade.id}]`,
-      );
-      return true; // fail-open
+    const cached = await redis.get(cacheKey(market));
+    if (cached) {
+      logger.debug(`[marketService] Cache hit: ${market} → ${cached}`);
+      return cached;
     }
-
-    const body = (await res.json()) as MidpointResponse;
-    const midPrice = parseFloat(body.mid ?? '');
-
-    if (isNaN(midPrice) || midPrice <= 0) {
-      logger.warn(
-        `[marketService] Invalid mid-price in response — skipping slippage check [id=${trade.id}]`,
-      );
-      return true; // fail-open
-    }
-
-    const slippage = Math.abs(midPrice - trade.price) / trade.price;
-    const slippagePct = (slippage * 100).toFixed(2);
-
-    logger.info(
-      `[marketService] Slippage check: trade.price=${trade.price} mid=${midPrice} ` +
-      `slippage=${slippagePct}% limit=${(MAX_SLIPPAGE * 100).toFixed(0)}% [id=${trade.id}]`,
-    );
-
-    if (slippage > MAX_SLIPPAGE) {
-      logger.warn(
-        `[marketService] Slippage exceeded: ${slippagePct}% > ${(MAX_SLIPPAGE * 100).toFixed(0)}%` +
-        ` — skipping trade ${trade.id}`,
-      );
-      return false;
-    }
-
-    return true;
   } catch (err) {
     logger.warn(
-      `[marketService] Slippage check error — proceeding (fail-open) [id=${trade.id}]`,
+      '[marketService] Redis cache read failed — continuing without cache',
       err instanceof Error ? err : new Error(String(err)),
     );
-    return true; // fail-open
+  }
+
+  // ── 2. Polymarket REST API ──────────────────────────────────────────────────
+  // Try the single-market endpoint first (most efficient); fall back to the
+  // list endpoint in case the host expects condition_id as a query parameter.
+
+  try {
+    let tokenId: string | null = null;
+
+    for (const url of [
+      `${POLYMARKET_REST_URL}/markets/${encodeURIComponent(market)}`,
+      `${POLYMARKET_REST_URL}/markets?condition_id=${encodeURIComponent(market)}`,
+    ]) {
+      const res = await fetch(url);
+      if (!res.ok) continue;
+
+      const body = (await res.json()) as MarketsApiResponse;
+      tokenId = extractTokenId(body);
+      if (tokenId) break;
+    }
+
+    if (tokenId) {
+      logger.info(`[marketService] Resolved via API: ${market} → ${tokenId}`);
+      await redis.set(cacheKey(market), tokenId, 'EX', CACHE_TTL_S).catch(() => {/* best-effort */});
+      return tokenId;
+    }
+
+    // ── 3. Passthrough — asset_id IS the token ID ───────────────────────────
+    // The API returned 2xx but no token entry — the market identifier that
+    // arrived in the trade event is most likely already an asset_id / token ID.
+    logger.debug(
+      `[marketService] No mapping found for market ${market} — ` +
+      `treating asset_id as token ID directly`,
+    );
+    await redis.set(cacheKey(market), market, 'EX', CACHE_TTL_S).catch(() => {/* best-effort */});
+    return market;
+
+  } catch (err) {
+    logger.error(
+      `[marketService] Network error resolving token for market ${market} — skipping trade`,
+      err instanceof Error ? err : new Error(String(err)),
+    );
+    return null;
   }
 }

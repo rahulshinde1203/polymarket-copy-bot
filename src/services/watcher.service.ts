@@ -6,7 +6,6 @@ import { buildOrder } from '../execution/orderBuilder';
 import { executeOrder } from '../execution/executor';
 import { getActiveTrader } from './trader.service';
 import { validateTrade, updateExposure } from '../core/riskManager';
-import { getMarketToken, checkSlippage } from './market.service';
 import {
   POLYMARKET_REST_URL,
   POLL_INTERVAL_MS,
@@ -57,10 +56,6 @@ async function processTrade(trade: TradeEvent): Promise<void> {
 
   const order = buildOrder(trade, copyPercentage);
   if (!order) return;
-
-  // Slippage gate: skip if market has moved more than MAX_SLIPPAGE from trade price
-  const tokenId = getMarketToken(trade.market);
-  if (!await checkSlippage(trade, tokenId)) return;
 
   if (!await validateTrade(trade, order.cost)) return;
 
