@@ -1,36 +1,24 @@
 import { TradeEvent } from '../types/tradeEvent';
 import logger from '../config/logger';
 import { shouldProcessTrade } from './tradeFilter';
-import { validateTrade, recordExposure } from './riskManager';
 
 export type TradeDecision = 'COPY' | 'SKIP';
 
 /**
- * The single entry point for the trade decision pipeline.
+ * Fast pre-filter for the trade pipeline.
  *
- * Returns "COPY" only when the trade clears every filter and risk rule.
- * Exposure is recorded inside this function on a COPY decision so the caller
- * cannot forget to update risk state.
- *
- * Order of checks (cheapest first):
- *   1. Trade filter  — size, price, latency (no I/O)
- *   2. Risk manager  — per-trade, total, per-market limits (in-memory)
+ * Checks only criteria that do not require knowing the scaled order size
+ * (size bounds, price bounds, source-specific latency).  Full risk validation
+ * — per-trade cap, total and per-market exposure — runs in processTrade()
+ * after buildOrder() computes the actual order size.
  */
 export function decideTrade(trade: TradeEvent): TradeDecision {
   if (!shouldProcessTrade(trade)) {
     return 'SKIP';
   }
 
-  if (!validateTrade(trade)) {
-    return 'SKIP';
-  }
-
-  // Record exposure BEFORE returning so concurrent evaluations see the updated
-  // totals and cannot both claim the same headroom.
-  recordExposure(trade);
-
   logger.info(
-    `[decisionEngine] Accepted: ${trade.side.toUpperCase()} ${trade.size} units` +
+    `[decisionEngine] Passed filter: ${trade.side.toUpperCase()} ${trade.size} units` +
     ` @ $${trade.price} on ${trade.market} [id=${trade.id}]`,
   );
 

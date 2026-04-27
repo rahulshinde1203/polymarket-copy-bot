@@ -1072,3 +1072,511 @@ The deduplication `Set` is cleared entirely (rather than pruned) when it exceeds
 - **Stale filter applies to all trades.** REST-polled trades with `timestamp` more than 2 s old are skipped. Polymarket timestamps trades at execution time, so fresh polls return recent trades within this window. Adjust `TRADE_LATENCY_THRESHOLD_MS` in constants if your polling latency exceeds 2 s.
 - **`source` field.** All trades produced by the polling watcher carry `source: 'rest'`. The `tradeFilter` latency gate in Phase 5 only applies to `source === 'ws'` trades, so there is no double-filtering.
 - **Graceful shutdown** clears the poll interval immediately — no in-flight requests are left dangling after `stopWatcher()` returns.
+
+---
+
+## Fix 1: Duplicate Trade Protection
+
+### What Was Fixed
+
+Replaced the in-memory `Set<string>` deduplication with Redis-based trade ID tracking. Each processed trade ID is written to Redis with a 60-second TTL under the key `trade:<id>`. Before any trade is evaluated, the watcher checks whether this key already exists in Redis. If it does, the trade is skipped immediately.
+
+**Changed files:**
+
+| File | Change |
+|------|--------|
+| [src/services/watcher.service.ts](src/services/watcher.service.ts) | `addToProcessed` / `processedTrades` Set replaced with `isDuplicate()` and `markProcessed()` using Redis |
+| [src/config/constants.ts](src/config/constants.ts) | `MAX_PROCESSED_TRADES` removed; `TRADE_DEDUP_TTL_S = 60` added |
+
+---
+
+### Why It Matters
+
+The in-memory `Set` was cleared entirely whenever it hit 1 000 entries. After a clear, any trade that arrived again within the same session would be treated as new and re-executed — potentially doubling a position. Redis-backed deduplication survives the clear cycle, process restarts, and future horizontal scaling because the store is shared rather than per-process.
+
+---
+
+### How It Works
+
+```
+pollTrades() — for each trade in API response:
+    │
+    ├─ isDuplicate(trade.id)
+    │     └─ redis.get('trade:<id>')
+    │           ├─ key exists  → log "Duplicate trade skipped"  (continue)
+    │           ├─ key absent  → proceed
+    │           └─ Redis error → log warning, treat as duplicate (safe default)
+    │
+    ├─ … wallet match, stale check …
+    │
+    ├─ markProcessed(trade.id)              ← BEFORE decideTrade()
+    │     └─ redis.set('trade:<id>', '1', 'EX', 60)
+    │           └─ Redis error → log warning, continue
+    │
+    └─ decideTrade(trade) → COPY / SKIP
+```
+
+The key is written **before** `decideTrade` is called. If execution throws after marking, the trade is still recorded as seen — preventing a re-attempt on the next poll tick. The 60-second TTL (`TRADE_DEDUP_TTL_S`) is long enough to cover several poll cycles but short enough that the Redis keyspace stays lean.
+
+---
+
+### Example
+
+The same trade appears in two consecutive poll responses (common when the API returns recent history on every call):
+
+```
+# First poll tick — trade id=abc123 seen for the first time
+[poll] Trade detected: id=abc123 buy 200 @ 0.65 wallet=0xAAA...
+[poll] New trade accepted: abc123
+[poll] ✓ MATCHED: BUY 200 units @ $0.65 on market 71321... [id=abc123]
+[executor] Simulated trade executed: BUY 200 units @ $0.65 on 71321...
+
+# Second poll tick (5 s later) — same trade returned by API again
+[poll] Trade detected: id=abc123 buy 200 @ 0.65 wallet=0xAAA...
+[poll] Duplicate trade skipped: abc123
+```
+
+The order is executed exactly once regardless of how many times the API returns it.
+
+---
+
+## Fix 2: Last Trade Tracking
+
+### What Was Fixed
+
+The watcher now persists the ID of the most recently processed trade in Redis under the key `last_trade_id:<trader_address>`. On every poll tick — including the first tick after a process restart — this cursor is loaded and used to skip trades that were already handled in a previous session.
+
+**Changed files:**
+
+| File | Change |
+|------|--------|
+| [src/services/watcher.service.ts](src/services/watcher.service.ts) | `pollTrades()` now loads the cursor before iterating, processes only trades newer than the cursor in chronological order, and advances the cursor after the loop |
+
+---
+
+### Why It Matters
+
+Without a cursor, every bot restart triggers a fresh fetch from the API. Polymarket returns recent trade history on every call, so the same trades the bot already executed would be returned again and evaluated as new. The per-trade Redis dedup key (TTL 60 s) provides a short window of protection, but a restart more than 60 seconds after the last execution would replay old trades and double-execute orders.
+
+The cursor is a permanent record — it has no TTL — so it protects across arbitrarily long restarts.
+
+---
+
+### How It Works
+
+```
+pollTrades()
+    │
+    ├─ fetch items from API        (newest-first order)
+    │
+    ├─ redis.get('last_trade_id:<address>')    ← load cursor
+    │     ├─ exists  → log "Last trade ID loaded: <id>"
+    │     └─ absent  → first run
+    │
+    ├─ Determine which items to process:
+    │     ├─ cursor absent:  toProcess = [items[0]] only
+    │     │                  (avoids flooding on first run)
+    │     └─ cursor present: log "Processing new trades only"
+    │                        for item of [...items].reverse()   ← oldest → newest
+    │                            if item.id === lastTradeId → break
+    │                            else toProcess.push(item)
+    │
+    ├─ for each trade in toProcess:
+    │     └─ … existing pipeline (dedup, wallet, stale, decide, execute) …
+    │
+    └─ redis.set('last_trade_id:<address>', items[0].id)   ← advance cursor
+          └─ log "Last trade ID updated: <id>"
+```
+
+The cursor is updated **after** the processing loop, so that a mid-loop failure (e.g. Redis dedup write error) doesn't advance the cursor past unprocessed trades — the next poll retries them safely.
+
+---
+
+### Example
+
+**Normal run (cursor exists):**
+
+```
+# Bot restarts. Redis holds: last_trade_id:0xAAA... = "trade-999"
+# API returns: [trade-1002, trade-1001, trade-1000, trade-999, trade-998, ...]
+
+[poll] Fetched 5 trade(s) for 0xAAA...
+[poll] Last trade ID loaded: trade-999
+[poll] Processing new trades only
+[poll] Trade detected: id=trade-1000 buy 50 @ 0.70 ...
+[poll] New trade accepted: trade-1000
+[poll] ✓ MATCHED: BUY 50 units @ $0.70 on market 71321... [id=trade-1000]
+[poll] Trade detected: id=trade-1001 buy 80 @ 0.65 ...
+[poll] New trade accepted: trade-1001
+[poll] ✓ MATCHED: BUY 80 units @ $0.65 on market 71321... [id=trade-1001]
+[poll] Trade detected: id=trade-1002 ...
+...
+[poll] Last trade ID updated: trade-1002
+```
+
+Trades `trade-999` and everything before it are never evaluated.
+
+**First run (no cursor):**
+
+```
+# Redis has no last_trade_id for this trader
+# API returns: [trade-1002, trade-1001, trade-1000, ...]
+
+[poll] Fetched 3 trade(s) for 0xAAA...
+[poll] No last trade ID — processing latest trade only to avoid backlog
+[poll] Trade detected: id=trade-1002 ...
+[poll] New trade accepted: trade-1002
+...
+[poll] Last trade ID updated: trade-1002
+```
+
+Only the single most recent trade is processed; the entire prior history is skipped.
+
+---
+
+## Fix 3: Exposure Risk Control
+
+### What Was Built
+
+Redis-backed exposure tracking that enforces three hard limits before any order is placed: a per-order cap, a total portfolio cap, and a per-market cap. Exposure counters are persisted in Redis so they survive process restarts and accumulate correctly across sessions.
+
+**Changed files:**
+
+| File | Change |
+|------|--------|
+| [src/core/riskManager.ts](src/core/riskManager.ts) | Full rewrite — Redis-based async `validateTrade(trade, orderSize)` + `updateExposure(orderSize, market)` |
+| [src/core/decisionEngine.ts](src/core/decisionEngine.ts) | Risk calls removed — `decideTrade` is now a fast sync pre-filter only |
+| [src/services/watcher.service.ts](src/services/watcher.service.ts) | `processTrade()` validates risk after `buildOrder()` and updates exposure after `executeOrder()` |
+| [src/config/constants.ts](src/config/constants.ts) | `MAX_PER_TRADE=100`, `MAX_TOTAL_EXPOSURE=500`, `MAX_PER_MARKET=200` (replaced old in-memory limits) |
+
+---
+
+### Why It Matters
+
+The previous risk manager used in-memory counters that reset to zero on every process restart. A bot crash and restart would clear all recorded exposure, allowing the limits to be breached repeatedly. Redis counters accumulate across restarts, so the configured limits are always respected regardless of how many times the process is restarted.
+
+The per-order size is also now the **scaled order size** (after applying copy percentage) rather than the raw trade size from the followed wallet — a 200-unit trade copied at 50 % only consumes 100 units of exposure budget.
+
+---
+
+### How It Works
+
+```
+processTrade(trade)
+    │
+    ├─ buildOrder(trade, copyPercentage)
+    │     └─ order.size = trade.size × (copyPct / 100)
+    │
+    ├─ validateTrade(trade, order.size)          [riskManager.ts]
+    │     ├─ order.size > MAX_PER_TRADE (100)?
+    │     │     → log "Rejected: exceeds per trade limit"    return false
+    │     ├─ redis.get('total_exposure') + size > MAX_TOTAL_EXPOSURE (500)?
+    │     │     → log "Rejected: exceeds total exposure"     return false
+    │     ├─ redis.get('market_exposure:<m>') + size > MAX_PER_MARKET (200)?
+    │     │     → log "Rejected: exceeds market exposure"    return false
+    │     └─ log "Accepted: within risk limits"              return true
+    │
+    ├─ executeOrder(order)
+    │
+    └─ updateExposure(order.size, trade.market)  [riskManager.ts]
+          ├─ redis.incrbyfloat('total_exposure', size)
+          └─ redis.incrbyfloat('market_exposure:<m>', size)
+```
+
+`updateExposure` is called **after** `executeOrder` so that a failed execution does not consume budget. Errors inside `updateExposure` are caught and logged as warnings — the order is already placed and must not be retried.
+
+---
+
+### Example
+
+Three orders arrive on the same market. `MAX_PER_MARKET = 200`.
+
+```
+# Order 1 — 90 units
+[riskManager] Accepted: within risk limits — orderSize=90 [id=trade-001]
+[executor]    Simulated trade executed: BUY 90 units @ $0.65 on market 71321...
+[riskManager] Exposure updated: +90 on market 71321...
+# Redis: total_exposure=90  market_exposure:71321...=90
+
+# Order 2 — 80 units
+[riskManager] Accepted: within risk limits — orderSize=80 [id=trade-002]
+[executor]    Simulated trade executed: BUY 80 units @ $0.70 on market 71321...
+[riskManager] Exposure updated: +80 on market 71321...
+# Redis: total_exposure=170  market_exposure:71321...=170
+
+# Order 3 — 50 units  (170 + 50 = 220 > MAX_PER_MARKET 200)
+[riskManager] Rejected: exceeds market exposure — market=71321... would reach 220
+              > MAX_PER_MARKET=200 [id=trade-003]
+# Order 3 blocked — no execution, no exposure change
+```
+
+---
+
+## Fix 4: Balance Check
+
+### What Was Built
+
+A wallet balance validation step that runs inside `executeOrder()` before any trade is dispatched. A simulated balance is returned in paper mode; live mode has a safe-reject stub that blocks all orders until a real ethers.js provider is wired in.
+
+New files:
+
+| File | Purpose |
+|------|---------|
+| [src/execution/balance.ts](src/execution/balance.ts) | `getWalletBalance(wallet)` — paper simulation or live provider stub |
+
+Updated files:
+
+| File | Change |
+|------|--------|
+| [src/execution/executor.ts](src/execution/executor.ts) | Calls `getWalletBalance` and enforces `balance ≥ order.size + MIN_REQUIRED_BALANCE` before dispatching |
+| [src/config/constants.ts](src/config/constants.ts) | `PAPER_SIMULATED_BALANCE = 10_000` and `MIN_REQUIRED_BALANCE = 10` added |
+| [src/config/env.ts](src/config/env.ts) | `BOT_WALLET` added (optional, defaults to empty string) |
+| [.env.example](.env.example) | `BOT_WALLET` placeholder documented |
+
+---
+
+### Why It Matters
+
+Without a balance check, the bot can attempt orders it has no funds to fill. On Polymarket's CLOB this results in a rejected API call or a stuck partial fill — both wasteful and potentially confusing to the risk accounting. Checking before dispatch means a low-balance situation is caught cleanly, logged with the exact shortfall, and the order is silently skipped without reaching the exchange.
+
+---
+
+### How It Works
+
+```
+executeOrder(order)                     [executor.ts]
+    │
+    ├─ getWalletBalance(env.BOT_WALLET) [balance.ts]
+    │     ├─ EXECUTION_MODE === 'paper'
+    │     │     └─ return PAPER_SIMULATED_BALANCE (10 000)
+    │     └─ EXECUTION_MODE === 'live'
+    │           ├─ BOT_WALLET empty → return 0
+    │           └─ TODO: ethers.js USDC balanceOf → return 0 (stub)
+    │
+    ├─ balance < order.size + MIN_REQUIRED_BALANCE (10)?
+    │     → log "Insufficient balance — skipping trade"
+    │     → return   (order never placed)
+    │
+    └─ dispatch (paper log or live API call)
+```
+
+`MIN_REQUIRED_BALANCE` (10) is a small buffer that ensures the wallet is never drained to exactly zero — the bot always keeps a reserve above the order size.
+
+---
+
+### Example
+
+**Paper mode (always passes — simulated balance is 10 000):**
+
+```
+[balance]  Paper mode — simulated balance: $10000 for wallet (not configured)
+[executor] Wallet balance: $10000 | Order size: $80 | Min required: $90
+[executor] Execution mode: paper
+[executor] Simulated trade executed: BUY 80 units @ $0.65 on market 71321...
+```
+
+**Live mode with low balance (order rejected):**
+
+```
+[balance]  Paper mode — simulated balance: $5 for wallet 0xBotWallet...
+[executor] Wallet balance: $5 | Order size: $80 | Min required: $90
+[executor] Insufficient balance — skipping trade: balance=$5 < required=$90
+           (order.size=80 + buffer=10)
+```
+
+**Live mode before ethers.js is integrated (always rejects safely):**
+
+```
+[balance]  Live balance check not yet implemented — defaulting balance to 0
+           for wallet 0xBotWallet... (order rejected)
+[executor] Insufficient balance — skipping trade: balance=$0 < required=$90
+```
+
+---
+
+### Notes
+
+- **`BOT_WALLET`** is the bot's own trading wallet, not the wallet being copied. Add it to `.env` when moving to live mode.
+- **Enabling real balance checks** requires installing `ethers` (`npm install ethers`), adding `RPC_URL` to env, and replacing the stub body in [src/execution/balance.ts](src/execution/balance.ts) with a `JsonRpcProvider` + ERC-20 `balanceOf` call.
+- **Paper mode always passes** the balance check (`PAPER_SIMULATED_BALANCE = 10 000`). Lower it in `.env` to test the rejection path during development.
+- **Live mode safe-rejects by default.** Until ethers.js is integrated, every live-mode order is blocked at the balance gate — this is intentional so a mistaken `EXECUTION_MODE=live` cannot place real orders.
+
+---
+
+## Fix 5: Execution Reliability
+
+### What Was Built
+
+Two reliability layers added to `executeOrder`: an execution-level Redis deduplication key (`execution:<tradeId>`) that blocks re-execution for 1 hour, and a retry wrapper using the existing `withRetry` helper (3 retries, 1 s → 2 s → 4 s exponential backoff). On final failure the error is re-thrown so the caller skips the exposure update — preventing inflated risk counters from orders that never actually executed.
+
+**Changed files:**
+
+| File | Change |
+|------|--------|
+| [src/execution/executor.ts](src/execution/executor.ts) | Execution dedup check, `withRetry` dispatch, success/failure logging |
+| [src/execution/orderBuilder.ts](src/execution/orderBuilder.ts) | `tradeId: string` added to `Order` interface and populated in `buildOrder` |
+| [src/services/watcher.service.ts](src/services/watcher.service.ts) | `executeOrder` + `updateExposure` wrapped in try/catch — exposure skipped on failure |
+| [src/config/constants.ts](src/config/constants.ts) | `EXECUTION_DEDUP_TTL_S = 3600` added |
+
+---
+
+### Why It Matters
+
+Temporary network errors, rate-limit responses, or brief Polymarket API outages should not cause a trade to be permanently missed. Without retries, a single transient failure silently drops the order. Without execution dedup, a retry loop that fires twice (e.g. from a process restart mid-flight) could double-execute the same order. Both hazards are addressed here.
+
+---
+
+### How It Works
+
+```
+executeOrder(order)
+    │
+    ├─ redis.get('execution:<tradeId>')
+    │     ├─ key exists → log "Duplicate execution blocked"  return
+    │     ├─ key absent → proceed
+    │     └─ Redis error → log warning, proceed (other guards remain active)
+    │
+    ├─ getWalletBalance() → balance check (existing)
+    │
+    ├─ withRetry(dispatch, { retries: 3, delayMs: 1000 })
+    │     │
+    │     ├─ attempt 1: log "Execution attempt 1"
+    │     │     ├─ success → break
+    │     │     └─ fail   → log "Attempt 1/4 failed — retrying in 1000ms"
+    │     │
+    │     ├─ attempt 2: log "Execution attempt 2"
+    │     │     ├─ success → break
+    │     │     └─ fail   → log "Attempt 2/4 failed — retrying in 2000ms"
+    │     │
+    │     ├─ attempt 3: log "Execution attempt 3"
+    │     │     ├─ success → break
+    │     │     └─ fail   → log "Attempt 3/4 failed — retrying in 4000ms"
+    │     │
+    │     └─ attempt 4 (final):
+    │           ├─ success → break
+    │           └─ fail   → throw   (withRetry logs "Failed after 4 attempt(s)")
+    │
+    ├─ on success:
+    │     ├─ log "Execution success: trade <id>"
+    │     └─ redis.set('execution:<tradeId>', '1', EX, 3600)
+    │
+    └─ on throw (all retries exhausted):
+          ├─ log "Execution failed after 3 retries — trade <id>"
+          └─ rethrow → processTrade catches → updateExposure is skipped
+```
+
+---
+
+### Example
+
+**Transient failure on attempt 1, success on attempt 2:**
+
+```
+[executor] Execution attempt 1
+[executor] Attempt 1/4 failed: connect ECONNRESET — retrying in 1000ms
+[executor] Execution attempt 2
+[executor] Simulated trade executed: BUY 80 units @ $0.65 on market 71321...
+[executor] Execution success: trade abc123
+```
+
+**All retries exhausted — exposure NOT updated:**
+
+```
+[executor] Execution attempt 1
+[executor] Attempt 1/4 failed: timeout — retrying in 1000ms
+[executor] Execution attempt 2
+[executor] Attempt 2/4 failed: timeout — retrying in 2000ms
+[executor] Execution attempt 3
+[executor] Attempt 3/4 failed: timeout — retrying in 4000ms
+[executor] Execution attempt 4
+[executor] Failed after 4 attempt(s): timeout
+[executor] Execution failed after 3 retries — trade abc123
+```
+
+**Duplicate execution blocked (e.g. second poll tick delivers same trade):**
+
+```
+[executor] Duplicate execution blocked — trade abc123 already executed
+```
+
+---
+
+## Live Execution Integration
+
+### What Was Built
+
+Real order placement on Polymarket using the official `@polymarket/clob-client` SDK, backed by an ethers.js wallet on Polygon.
+
+| File | Role |
+|------|------|
+| `src/execution/polymarketClient.ts` | Lazy ClobClient singleton — ethers v6 adapter + optional API key auth |
+| `src/execution/balance.ts` | Live USDC balance via Polygon RPC (`ethers.JsonRpcProvider`) |
+| `src/execution/executor.ts` | Slippage guard → `createAndPostOrder` → dedup write |
+
+---
+
+### How It Works
+
+1. **Wallet**: `ethers.Wallet` is created from `PRIVATE_KEY` and wrapped in an adapter so `@polymarket/clob-client` (which expects ethers v5's `_signTypedData`) works with ethers v6's `signTypedData`.
+2. **Auth**: If `CLOB_API_KEY` / `CLOB_SECRET` / `CLOB_PASSPHRASE` are set, the client uses faster Level 2 API-key auth. Otherwise it falls back to Level 1 on-chain signing (slower but requires no pre-registration).
+3. **Balance check**: Queries the native USDC contract (`0x3c499c…`) on Polygon, formatted from 6 decimals.
+4. **Slippage guard**: Before placing the order, `getMidpoint(tokenID)` is called. If the copied trade's price deviates more than `MAX_SLIPPAGE_PCT` (default 1%) from mid-market, the order is rejected.
+5. **Order placement**: `createAndPostOrder(userOrder, undefined, OrderType.GTC)` submits a Good-Till-Cancelled limit order. The returned `orderID` is logged.
+6. **Retry**: `withRetry` wraps the dispatch with 3 retries at 1 s → 2 s → 4 s backoff (inherited from Fix 5).
+
+---
+
+### Safety
+
+| Guard | Behaviour |
+|-------|-----------|
+| `EXECUTION_MODE=paper` | No API calls made — logs simulated execution only |
+| Redis execution dedup | 1-hour TTL key blocks re-execution of the same trade ID |
+| Balance check | Rejects if wallet balance < `order.size + MIN_REQUIRED_BALANCE ($10)` |
+| Slippage check | Rejects if price moved > `MAX_SLIPPAGE_PCT` from mid (live mode only) |
+| Missing `PRIVATE_KEY` | `getClobClient()` throws immediately — order never attempted |
+
+---
+
+### New Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PRIVATE_KEY` | live only | — | 0x-prefixed private key of the trading wallet |
+| `RPC_URL` | no | `https://polygon-rpc.com` | Polygon JSON-RPC for balance reads |
+| `CLOB_API_KEY` | no | — | Polymarket API key (L2 auth — faster) |
+| `CLOB_SECRET` | no | — | Polymarket API secret |
+| `CLOB_PASSPHRASE` | no | — | Polymarket API passphrase |
+| `MAX_SLIPPAGE_PCT` | no | `1` | Max price deviation vs mid-market (%) |
+
+**PRIVATE_KEY security**: never commit this value. In production, load it from a secrets manager (AWS Secrets Manager, Vault, etc.) via your deployment pipeline.
+
+---
+
+### Example Log Output (Live Mode)
+
+**Successful order placement:**
+
+```
+[balance]         Live balance: $245.50 for wallet 0xAbC...
+[executor]        Wallet balance: $245.50 | Order size: $12 | Min required: $22
+[executor]        Slippage check: order.price=0.62 mid=0.621 deviation=0.161% limit=1%
+[executor]        Execution attempt 1
+[executor]        Placing live order: BUY 12 units @ $0.62 tokenID=71321...
+[executor]        Order accepted by Polymarket: orderId=0xDe9... trade=abc-xyz
+[executor]        Execution success: trade abc-xyz
+```
+
+**Slippage rejection:**
+
+```
+[executor]  Slippage check: order.price=0.55 mid=0.621 deviation=11.4% limit=1%
+[executor]  Slippage exceeded — skipping trade abc-xyz: deviation=11.4% > limit=1%
+```
+
+**Paper mode (no API calls):**
+
+```
+[executor]  Simulated trade executed: BUY 12 units @ $0.62 on 71321...
+[executor]  Execution success: trade abc-xyz
+```

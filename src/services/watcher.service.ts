@@ -5,11 +5,12 @@ import { decideTrade } from '../core/decisionEngine';
 import { buildOrder } from '../execution/orderBuilder';
 import { executeOrder } from '../execution/executor';
 import { getActiveTrader } from './trader.service';
+import { validateTrade, updateExposure } from '../core/riskManager';
 import {
   POLYMARKET_REST_URL,
   POLL_INTERVAL_MS,
   TRADE_LATENCY_THRESHOLD_MS,
-  MAX_PROCESSED_TRADES,
+  TRADE_DEDUP_TTL_S,
   DEFAULT_COPY_PERCENTAGE,
 } from '../config/constants';
 
@@ -56,7 +57,15 @@ async function processTrade(trade: TradeEvent): Promise<void> {
   const order = buildOrder(trade, copyPercentage);
   if (!order) return;
 
-  await executeOrder(order);
+  if (!await validateTrade(trade, order.size)) return;
+
+  try {
+    await executeOrder(order);
+    await updateExposure(order.size, trade.market);
+  } catch {
+    // executeOrder already logged the full failure chain — exposure is NOT
+    // updated because the order was never placed successfully.
+  }
 }
 
 // ── WatcherService ────────────────────────────────────────────────────────────
@@ -64,9 +73,6 @@ async function processTrade(trade: TradeEvent): Promise<void> {
 class WatcherService {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
-
-  // In-memory deduplication — cleared when it exceeds MAX_PROCESSED_TRADES
-  private processedTrades = new Set<string>();
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -98,14 +104,33 @@ class WatcherService {
     }
   }
 
-  // ── Deduplication ───────────────────────────────────────────────────────────
+  // ── Redis deduplication ─────────────────────────────────────────────────────
+  // Trade IDs are stored in Redis with a TTL so restarts never replay old trades.
+  // On Redis failure we treat the trade as a duplicate (safe default — better to
+  // miss one trade than to double-execute).
 
-  private addToProcessed(id: string): void {
-    if (this.processedTrades.size >= MAX_PROCESSED_TRADES) {
-      this.processedTrades.clear();
-      logger.debug('[watcher] processedTrades cleared (limit reached)');
+  private async isDuplicate(id: string): Promise<boolean> {
+    try {
+      const existing = await redis.get(`trade:${id}`);
+      return existing !== null;
+    } catch (err) {
+      logger.warn(
+        `[poll] Redis dedup check failed for trade ${id} — skipping as precaution`,
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      return true;
     }
-    this.processedTrades.add(id);
+  }
+
+  private async markProcessed(id: string): Promise<void> {
+    try {
+      await redis.set(`trade:${id}`, '1', 'EX', TRADE_DEDUP_TTL_S);
+    } catch (err) {
+      logger.warn(
+        `[poll] Redis dedup write failed for trade ${id}`,
+        err instanceof Error ? err : new Error(String(err)),
+      );
+    }
   }
 
   // ── Trade parsing ───────────────────────────────────────────────────────────
@@ -146,6 +171,12 @@ class WatcherService {
     return { id, wallet, market, price, size, side, timestamp, source: 'rest' };
   }
 
+  // ── Last-trade cursor helpers ────────────────────────────────────────────────
+
+  private lastTradeKey(traderAddress: string): string {
+    return `last_trade_id:${traderAddress}`;
+  }
+
   // ── Poll loop ───────────────────────────────────────────────────────────────
 
   private async pollTrades(): Promise<void> {
@@ -173,9 +204,42 @@ class WatcherService {
       const body = (await res.json()) as PolymarketRestResponse | RawTradeMessage[];
       const items: RawTradeMessage[] = Array.isArray(body) ? body : (body.data ?? []);
 
+      if (items.length === 0) return;
+
       logger.debug(`[poll] Fetched ${items.length} trade(s) for ${activeAddress}`);
 
-      for (const item of items) {
+      // ── Cursor: load last processed trade ID ──────────────────────────────
+      // API returns trades newest-first. The cursor tells us where we stopped
+      // last time so we can skip already-processed trades across restarts.
+
+      const lastTradeId = await redis.get(this.lastTradeKey(activeAddress));
+      if (lastTradeId) {
+        logger.debug(`[poll] Last trade ID loaded: ${lastTradeId}`);
+      }
+
+      // Determine which raw items are new
+      let toProcess: RawTradeMessage[];
+
+      if (!lastTradeId) {
+        // First run — process only the single newest trade to avoid replaying
+        // the trader's entire history (which could be thousands of old trades).
+        toProcess = [items[0]];
+        logger.debug('[poll] No last trade ID — processing latest trade only to avoid backlog');
+      } else {
+        // Oldest → newest so we process in chronological order.
+        // Stop as soon as we hit the ID we processed last time.
+        logger.debug('[poll] Processing new trades only');
+        toProcess = [];
+        for (const item of [...items].reverse()) {
+          const itemId = item.id ?? item.trade_id;
+          if (itemId === lastTradeId) break;
+          toProcess.push(item);
+        }
+      }
+
+      // ── Evaluate each new trade through the existing pipeline ─────────────
+
+      for (const item of toProcess) {
         const trade = this.parseTradeMessage(item);
         if (!trade) continue;
 
@@ -184,9 +248,9 @@ class WatcherService {
           `${trade.size} @ ${trade.price} wallet=${trade.wallet}`,
         );
 
-        // Duplicate check
-        if (this.processedTrades.has(trade.id)) {
-          logger.debug(`[poll] Duplicate skipped: ${trade.id}`);
+        // Duplicate check (Redis TTL key)
+        if (await this.isDuplicate(trade.id)) {
+          logger.debug(`[poll] Duplicate trade skipped: ${trade.id}`);
           continue;
         }
 
@@ -214,8 +278,9 @@ class WatcherService {
           ` @ $${trade.price} on ${trade.market} [id=${trade.id}]`,
         );
 
-        // Mark before evaluating — prevents re-processing if the decision throws
-        this.addToProcessed(trade.id);
+        // Mark in Redis before evaluating — prevents re-processing if the decision throws
+        logger.debug(`[poll] New trade accepted: ${trade.id}`);
+        await this.markProcessed(trade.id);
 
         const decision = decideTrade(trade);
         logger.debug(`[poll] Decision for ${trade.id}: ${decision}`);
@@ -223,6 +288,17 @@ class WatcherService {
         if (decision === 'COPY') {
           await processTrade(trade);
         }
+      }
+
+      // ── Cursor: advance to the newest trade returned by the API ──────────
+      // items[0] is always the most recent trade (API is newest-first).
+      // Storing it here means the next poll — or the next restart — skips
+      // everything up to and including this trade.
+
+      const newestId = items[0].id ?? items[0].trade_id;
+      if (newestId) {
+        await redis.set(this.lastTradeKey(activeAddress), newestId);
+        logger.debug(`[poll] Last trade ID updated: ${newestId}`);
       }
     } catch (err) {
       logger.error(

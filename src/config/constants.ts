@@ -11,8 +11,8 @@ export const POLYMARKET_REST_URL = 'https://clob.polymarket.com';
 export const POLL_INTERVAL_MS = 5_000;        // REST polling cadence
 
 // ── Watcher — trade validation ────────────────────────────────────────────────
-export const TRADE_LATENCY_THRESHOLD_MS = 2_000;  // Reject WS trades older than this
-export const MAX_PROCESSED_TRADES = 1_000;         // Prune dedup Set above this size
+export const TRADE_LATENCY_THRESHOLD_MS = 2_000;  // Reject trades older than this
+export const TRADE_DEDUP_TTL_S = 60;               // Redis TTL for processed trade IDs (seconds)
 
 // ── Decision engine — trade filter ───────────────────────────────────────────
 export const MIN_TRADE_SIZE = 5;         // Minimum trade size in USD
@@ -20,10 +20,20 @@ export const MAX_TRADE_SIZE = 10_000;    // Maximum trade size in USD
 export const MIN_PRICE = 0.01;           // Minimum price (Polymarket 0–1 scale)
 export const MAX_PRICE = 0.99;           // Maximum price (Polymarket 0–1 scale)
 
-// ── Decision engine — risk manager ───────────────────────────────────────────
-export const MAX_PER_TRADE = 500;        // Max USD size for a single copied trade
-export const TOTAL_SPEND_LIMIT = 5_000;  // Max total USD exposure across all markets
-export const MAX_PER_MARKET = 1_000;     // Max USD exposure on any single market
+// ── Risk manager ─────────────────────────────────────────────────────────────
+export const MAX_PER_TRADE = 100;           // Max USD size for a single copied order
+export const MAX_TOTAL_EXPOSURE = 500;      // Max total USD exposure across all markets
+export const MAX_PER_MARKET = 200;          // Max USD exposure on any single market
 
 // ── Execution engine ──────────────────────────────────────────────────────────
-export const DEFAULT_COPY_PERCENTAGE = 100;  // Used when the active trader has no copy_percentage set
+export const DEFAULT_COPY_PERCENTAGE = 100;   // Used when the active trader has no copy_percentage set
+export const PAPER_SIMULATED_BALANCE = 10_000;  // Simulated wallet balance returned in paper mode
+export const MIN_REQUIRED_BALANCE = 10;         // Buffer kept in wallet above order.size (live mode)
+export const EXECUTION_DEDUP_TTL_S = 3_600;    // Redis TTL for executed order IDs (1 hour)
+
+// ── Live execution — Polymarket CLOB ─────────────────────────────────────────
+export const POLYGON_CHAIN_ID = 137;
+// Native USDC on Polygon (6 decimals)
+export const USDC_ADDRESS_POLYGON = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
+// Max allowed price deviation between the copied trade price and current mid-price (%)
+export const MAX_SLIPPAGE_PCT = 1;

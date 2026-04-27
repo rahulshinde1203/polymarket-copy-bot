@@ -2,6 +2,7 @@ import { TradeEvent } from '../types/tradeEvent';
 import logger from '../config/logger';
 
 export interface Order {
+  tradeId: string;
   market: string;
   price: number;
   size: number;
@@ -34,6 +35,7 @@ export function buildOrder(trade: TradeEvent, copyPercentage: number): Order | n
   }
 
   const order: Order = {
+    tradeId: trade.id,
     market: trade.market,
     price: trade.price,
     size,

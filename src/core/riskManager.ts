@@ -1,77 +1,81 @@
+import redis from '../infra/cache/redis';
 import { TradeEvent } from '../types/tradeEvent';
 import logger from '../config/logger';
-import { MAX_PER_TRADE, TOTAL_SPEND_LIMIT, MAX_PER_MARKET } from '../config/constants';
+import { MAX_PER_TRADE, MAX_TOTAL_EXPOSURE, MAX_PER_MARKET } from '../config/constants';
 
-// ── In-memory exposure state ──────────────────────────────────────────────────
-// Resets on process restart. In a future phase this can be persisted to Redis
-// or PostgreSQL so limits survive restarts.
+// ── Redis key helpers ─────────────────────────────────────────────────────────
 
-let totalExposure = 0;
-const marketExposure = new Map<string, number>();
+const TOTAL_EXPOSURE_KEY = 'total_exposure';
+
+function marketKey(market: string): string {
+  return `market_exposure:${market}`;
+}
+
+async function readExposure(key: string): Promise<number> {
+  const val = await redis.get(key);
+  if (val === null) return 0;
+  const parsed = parseFloat(val);
+  return isNaN(parsed) ? 0 : parsed;
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Returns true if the trade is within all configured risk limits.
- * Does NOT mutate exposure state — call recordExposure() after a COPY decision.
+ * Returns true when the order is within all configured risk limits.
+ * Does NOT mutate exposure — call updateExposure() after a successful execution.
  */
-export function validateTrade(trade: TradeEvent): boolean {
-  if (trade.size > MAX_PER_TRADE) {
+export async function validateTrade(trade: TradeEvent, orderSize: number): Promise<boolean> {
+  if (orderSize > MAX_PER_TRADE) {
     logger.debug(
-      `[riskManager] Skipped: exceeds per-trade limit — ` +
-      `size=${trade.size} > MAX_PER_TRADE=${MAX_PER_TRADE} [id=${trade.id}]`,
+      `[riskManager] Rejected: exceeds per trade limit — ` +
+      `orderSize=${orderSize} > MAX_PER_TRADE=${MAX_PER_TRADE} [id=${trade.id}]`,
     );
     return false;
   }
 
-  if (totalExposure + trade.size > TOTAL_SPEND_LIMIT) {
+  const totalExposure = await readExposure(TOTAL_EXPOSURE_KEY);
+  if (totalExposure + orderSize > MAX_TOTAL_EXPOSURE) {
     logger.warn(
-      `[riskManager] Skipped: exceeds risk limit — would reach` +
-      ` total=${totalExposure + trade.size} > TOTAL_SPEND_LIMIT=${TOTAL_SPEND_LIMIT}` +
-      ` [id=${trade.id}]`,
+      `[riskManager] Rejected: exceeds total exposure — ` +
+      `would reach ${totalExposure + orderSize} > MAX_TOTAL_EXPOSURE=${MAX_TOTAL_EXPOSURE} [id=${trade.id}]`,
     );
     return false;
   }
 
-  const currentMarket = marketExposure.get(trade.market) ?? 0;
-  if (currentMarket + trade.size > MAX_PER_MARKET) {
+  const marketExposure = await readExposure(marketKey(trade.market));
+  if (marketExposure + orderSize > MAX_PER_MARKET) {
     logger.warn(
-      `[riskManager] Skipped: exceeds market exposure — ` +
-      `market=${trade.market} would reach ${currentMarket + trade.size}` +
+      `[riskManager] Rejected: exceeds market exposure — ` +
+      `market=${trade.market} would reach ${marketExposure + orderSize}` +
       ` > MAX_PER_MARKET=${MAX_PER_MARKET} [id=${trade.id}]`,
     );
     return false;
   }
 
+  logger.debug(
+    `[riskManager] Accepted: within risk limits — orderSize=${orderSize} [id=${trade.id}]`,
+  );
   return true;
 }
 
 /**
- * Increments exposure counters after a COPY decision is confirmed.
- * Must be called exactly once per accepted trade.
+ * Increments total and per-market exposure counters in Redis after a successful execution.
+ * Errors are logged as warnings and do not propagate — the order is already placed.
  */
-export function recordExposure(trade: TradeEvent): void {
-  totalExposure += trade.size;
-  const newMarket = (marketExposure.get(trade.market) ?? 0) + trade.size;
-  marketExposure.set(trade.market, newMarket);
-
-  logger.debug(
-    `[riskManager] Exposure updated: total=${totalExposure}` +
-    ` market[${trade.market}]=${newMarket}`,
-  );
+export async function updateExposure(orderSize: number, market: string): Promise<void> {
+  try {
+    await redis.incrbyfloat(TOTAL_EXPOSURE_KEY, orderSize);
+    await redis.incrbyfloat(marketKey(market), orderSize);
+    logger.debug(`[riskManager] Exposure updated: +${orderSize} on market ${market}`);
+  } catch (err) {
+    logger.warn(
+      '[riskManager] Failed to update exposure in Redis',
+      err instanceof Error ? err : new Error(String(err)),
+    );
+  }
 }
 
-/** Returns a snapshot of current exposure for monitoring or Telegram /stats. */
-export function getExposureSummary(): { total: number; byMarket: Record<string, number> } {
-  return {
-    total: totalExposure,
-    byMarket: Object.fromEntries(marketExposure),
-  };
-}
-
-/** Resets all exposure counters. Useful for daily resets or testing. */
-export function resetExposure(): void {
-  totalExposure = 0;
-  marketExposure.clear();
-  logger.info('[riskManager] Exposure counters reset');
+/** Returns total exposure snapshot for monitoring or Telegram /stats. */
+export async function getExposureSummary(): Promise<number> {
+  return readExposure(TOTAL_EXPOSURE_KEY);
 }
